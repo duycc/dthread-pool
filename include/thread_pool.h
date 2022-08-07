@@ -23,169 +23,129 @@ using namespace std::chrono;
 namespace tp {
 class DThreadPool {
   public:
-    struct TaskFunc {
-        TaskFunc(uint64_t _timeout) : timeout(_timeout) {}
-
-        std::function<void()> func;
-        uint64_t timeout{0}; // 任务超时时间
-    };
-    using TaskFuncPtr = std::shared_ptr<TaskFunc>;
-
-    DThreadPool();
+    explicit DThreadPool(size_t);
+    DThreadPool(const DThreadPool&) = delete;
+    DThreadPool& operator=(const DThreadPool&) = delete;
 
     virtual ~DThreadPool();
 
-    bool init(size_t num);
+    // 启动线程池
+    void start();
 
-    size_t getThreadNum();
-
-    size_t getTaskNum();
-
-    void stop();
-
-    bool start();
-
-    template <typename F, typename... Args>
-    auto exec(F&& f, Args&&... args) -> std::future<decltype(f(args...))> {
-        return exec(0, f, args...);
-    }
-
-    template <typename F, typename... Args>
-    auto exec(uint64_t timeout, F&& f, Args&&... args) -> std::future<decltype(f(args...))> {
-        uint64_t expireTime = (timeout == 0 ? 0 : high_resolution_clock::now() + timeout); // TODO
-        using RetType = decltype(f(args...));
-        auto task =
-            std::make_shared<std::packaged_task<RetType()>>(std::bind(std::forward<F>(f), std::forward<Args>(args)...));
-        TaskFuncPtr fPtr = std::make_shared<TaskFunc>(expireTime);
-        fPtr->func = [task] { (*task)(); };
-
-        std::unique_lock<std::mutex> lock(mutex_);
-        tasks_.emplace(fPtr);
-        condVar_.notify_one();
-        return task->get_future();
-    }
-
-    bool waitForAllDone(int millsecond = -1);
-
-    bool get(TaskFuncPtr& task);
-
-    bool isTerminate() { return isTerminate_; }
-
+    // 线程入口函数
     void run();
 
+    // 获取一个待执行的任务
+    std::function<void()> get();
+
+    // 提交一个待执行的任务
+    template <typename F, typename... Args>
+    auto submit(F&& f, Args&&... args) -> std::future<decltype(f(args...))>;
+
+    // 等待队列中所有任务执行完毕，如果超时未完成，不继续等待
+    bool waitForAllDone(int timeoutMs = -1);
+
+    // 关闭线程池
+    void stop();
+
+    // 获取线程个数
+    size_t getThreadNum() { return threadNum_; }
+
+    // 获取任务个数
+    size_t getTaskNum() {
+        std::unique_lock<std::mutex> lock(taskMutex_);
+        return tasks_.size();
+    }
+
   private:
-    std::queue<TaskFuncPtr> tasks_;
-    std::vector<std::thread*> threads_;
+    std::queue<std::function<void()>>         tasks_;   // 任务队列
+    std::vector<std::shared_ptr<std::thread>> threads_; // 工作线程
 
-    std::condition_variable condVar_;
-
-    std::mutex mutex_;
-    size_t threadNum_{1};
-    bool isTerminate_{false};
-    std::atomic<int> atomic_;
+    std::mutex              taskMutex_;     // 线程间互斥
+    std::condition_variable condVar_;       // 线程间同步
+    std::atomic<bool>       stop_{false};   // 线程池是否退出
+    std::atomic<int>        runTaskNum_{0}; // 运行中的任务个数
+    size_t                  threadNum_;     // 线程数
 };
 
-DThreadPool::DThreadPool() {}
+DThreadPool::DThreadPool(size_t threadNum) {
+    threadNum_ = std::min(threadNum, static_cast<size_t>(std::thread::hardware_concurrency()) * 2 + 2);
+    threads_.reserve(threadNum_);
+}
 
 DThreadPool::~DThreadPool() { stop(); }
 
-bool DThreadPool::init(size_t num) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    if (!threads_.empty()) {
-        return false;
-    }
-    threadNum_ = num;
-    return true;
-}
-
-size_t DThreadPool::getThreadNum() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    return threads_.size();
-}
-
-size_t DThreadPool::getTaskNum() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    return tasks_.size();
-}
-
-void DThreadPool::stop() {
-    {
-        std::unique_lock<std::mutex> lock(mutex_);
-        isTerminate_ = true;
-        condVar_.notify_all();
-    }
-    for (auto* t : threads_) {
-        if (t->joinable()) {
-            t->join();
-        }
-        delete t;
-        t = nullptr;
-    }
-    std::unique_lock<std::mutex> lock(mutex_);
-    std::vector<std::thread*>().swap(threads_);
-}
-
-bool DThreadPool::start() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    if (!threads_.empty()) {
-        return false;
-    }
+void DThreadPool::start() {
     for (size_t i = 0; i < threadNum_; ++i) {
-        threads_.emplace_back(new std::thread(&DThreadPool::run, this));
+        threads_.emplace_back(std::make_shared<std::thread>(&DThreadPool::run, this));
     }
-    return true;
-}
-
-bool DThreadPool::get(TaskFuncPtr& task) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    if (tasks_.empty()) {
-        condVar_.wait(lock, [this] { return isTerminate_ || !tasks_.empty(); });
-    }
-    if (isTerminate_) {
-        return false;
-    }
-    if (!tasks_.empty()) {
-        task = std::move(tasks_.front());
-        tasks_.pop();
-        return true;
-    }
-    return false;
 }
 
 void DThreadPool::run() {
-    while (!isTerminate()) {
-        TaskFuncPtr task;
-        bool ok = get(task);
-        if (ok) {
-            ++atomic_;
+    while (!stop_) {
+        auto&& task = get();
+        if (task) {
+            ++runTaskNum_;
             try {
-                if (task->timeout != 0 && task->timeout < high_resolution_clock::now()) {
-
-                } else {
-                    task->func();
-                }
+                task();
             } catch (...) {
             }
-            --atomic_;
+            --runTaskNum_;
 
-            std::unique_lock<std::mutex> lock(mutex_);
-            if (atomic_ == 0 && tasks_.empty()) {
-                condVar_.notify_all();
+            std::unique_lock<std::mutex> lock(taskMutex_);
+            if (runTaskNum_ == 0 && tasks_.empty()) {
+                condVar_.notify_all(); // 通知 waitForAllDone()
             }
         }
     }
 }
 
-bool DThreadPool::waitForAllDone(int millsecond) {
-    std::unique_lock<std::mutex> lock(mutex_);
+std::function<void()> DThreadPool::get() {
+    std::unique_lock<std::mutex> lock(taskMutex_);
+    if (tasks_.empty()) {
+        condVar_.wait(lock, [this] { return stop_ || !tasks_.empty(); });
+    }
+    if (stop_) {
+        return std::function<void()>(nullptr);
+    }
+    auto task = std::move(tasks_.front());
+    tasks_.pop();
+    return task;
+}
+
+template <typename F, typename... Args>
+auto DThreadPool::submit(F&& f, Args&&... args) -> std::future<decltype(f(args...))> {
+    using RetType = decltype(f(args...));
+    auto task =
+        std::make_shared<std::packaged_task<RetType()>>(std::bind(std::forward<F>(f), std::forward<Args>(args)...));
+
+    std::unique_lock<std::mutex> lock(taskMutex_);
+    tasks_.emplace([task] { (*task)(); });
+    condVar_.notify_one();
+    return task->get_future();
+}
+
+bool DThreadPool::waitForAllDone(int timeoutMs) {
+    std::unique_lock<std::mutex> lock(taskMutex_);
     if (tasks_.empty()) {
         return true;
     }
-    if (millsecond < 0) {
+    if (timeoutMs <= 0) {
         condVar_.wait(lock, [this] { return tasks_.empty(); });
         return true;
     }
-    return condVar_.wait_for(lock, milliseconds(millsecond), [this] { return tasks_.empty(); });
+    return condVar_.wait_for(lock, milliseconds(timeoutMs), [this] { return tasks_.empty(); });
+}
+
+void DThreadPool::stop() {
+    stop_ = true;
+    condVar_.notify_all();
+    for (auto& t : threads_) {
+        if (t->joinable()) {
+            t->join();
+        }
+    }
+    decltype(threads_)().swap(threads_); // 释放内存，clear()只是清空元素
 }
 
 } // namespace tp
